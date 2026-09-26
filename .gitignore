@@ -1,0 +1,20 @@
+# Run output the driver writes into the working directory by default
+# (-results-dir defaults to ./results).
+/results/
+
+# Go build and test artifacts
+*.test
+*.out
+*.prof
+/examples/rqlite/qa/qa
+/examples/rqlite/harness/harness
+/examples/tutorial/kvd/kvd
+/examples/tutorial/0[1-5]-*/0[1-5]-*
+/examples/tutorial/06-launcher/suite/suite
+/examples/tutorial/06-launcher/launcher/launcher
+
+# Editor and OS noise
+.DS_Store
+.idea/
+.vscode/
+*.swp

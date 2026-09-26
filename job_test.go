@@ -1,0 +1,302 @@
+package torx
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"sync"
+	"testing"
+)
+
+// newFakeServiceSpec builds a fake service with a node demand but no bound nodes,
+// for exercising Declare sizing and Bind.
+func newFakeServiceSpec(name string, log *[]string, size int) *fakeService {
+	f := &fakeService{log: log, failStart: map[string]bool{}, failStop: map[string]bool{}, failClean: map[string]bool{}}
+	f.ServiceBase = NewServiceBase(name, Homogeneous(size, NodeSpec{}), f)
+	return f
+}
+
+// fakeJob uses the default JobBase lifecycle and registers given services.
+type fakeJob struct {
+	JobBase
+	services []Service
+}
+
+func (j *fakeJob) Declare(jc *JobContext) {
+	for _, s := range j.services {
+		jc.Register(s)
+	}
+}
+
+func (j *fakeJob) Run(context.Context, *JobContext) error { return nil }
+
+var _ Job = (*fakeJob)(nil)
+
+func TestParams(t *testing.T) {
+	p := Params{"n": 5, "f": float64(3), "name": "x", "flag": true}
+	if got := p.Int("n", 0); got != 5 {
+		t.Errorf("Int(n) = %d, want 5", got)
+	}
+	if got := p.Int("f", 0); got != 3 { // JSON numbers arrive as float64
+		t.Errorf("Int(f) = %d, want 3", got)
+	}
+	if got := p.Int("missing", 7); got != 7 {
+		t.Errorf("Int(missing) = %d, want 7 (default)", got)
+	}
+	if got := p.String("name", ""); got != "x" {
+		t.Errorf("String(name) = %q, want x", got)
+	}
+	if got := p.Bool("flag", false); !got {
+		t.Errorf("Bool(flag) = false, want true")
+	}
+	if got := (Params(nil)).Int("x", 9); got != 9 {
+		t.Errorf("nil Params Int = %d, want 9", got)
+	}
+}
+
+func TestJobDeclareRegistersAndSizes(t *testing.T) {
+	var log []string
+	j := &fakeJob{services: []Service{
+		newFakeServiceSpec("a", &log, 2),
+		newFakeServiceSpec("b", &log, 3),
+	}}
+	jc := NewJobContext(nil, nil)
+	j.Declare(jc)
+
+	if len(jc.Services()) != 2 {
+		t.Errorf("services = %d, want 2", len(jc.Services()))
+	}
+	if jc.PoolSpec().Size() != 5 {
+		t.Errorf("PoolSpec size = %d, want 5", jc.PoolSpec().Size())
+	}
+}
+
+func TestJobContextBind(t *testing.T) {
+	var log []string
+	a := newFakeServiceSpec("a", &log, 2)
+	b := newFakeServiceSpec("b", &log, 3)
+	jc := NewJobContext(nil, nil)
+	jc.Register(a)
+	jc.Register(b)
+
+	pool := NewPool([]*Node{
+		testNode(t, "0"), testNode(t, "1"), testNode(t, "2"), testNode(t, "3"), testNode(t, "4"),
+	})
+	sub, err := pool.Allocate(jc.PoolSpec())
+	if err != nil {
+		t.Fatalf("Allocate: %v", err)
+	}
+	jc.Bind(sub.Nodes())
+
+	if len(a.Nodes()) != 2 {
+		t.Errorf("a got %d nodes, want 2", len(a.Nodes()))
+	}
+	if len(b.Nodes()) != 3 {
+		t.Errorf("b got %d nodes, want 3", len(b.Nodes()))
+	}
+}
+
+func TestJobBaseSetupStartsServices(t *testing.T) {
+	var log []string
+	jc := NewJobContext(nil, nil)
+	jc.Register(newFakeService("a", &log, []*Node{testNode(t, "n")}))
+
+	var base JobBase
+	if err := base.Setup(context.Background(), jc); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+	if !slices.Contains(log, "a:start:n") {
+		t.Errorf("service not started: %v", log)
+	}
+	if !slices.Contains(log, "a:wait:n") {
+		t.Errorf("service not waited: %v", log)
+	}
+}
+
+func TestJobBaseTeardownTearsDownAndRunsFinalizers(t *testing.T) {
+	var log []string
+	jc := NewJobContext(nil, nil)
+	jc.Register(newFakeService("a", &log, []*Node{testNode(t, "n")}))
+	finalized := false
+	jc.Defer(func(context.Context) error { finalized = true; return nil })
+
+	var base JobBase
+	if err := base.Teardown(context.Background(), jc); err != nil {
+		t.Fatalf("Teardown: %v", err)
+	}
+	if !slices.Contains(log, "a:stop:n") || !slices.Contains(log, "a:clean:n") {
+		t.Errorf("service not torn down: %v", log)
+	}
+	if !finalized {
+		t.Errorf("finalizer not run")
+	}
+}
+
+func TestJobContextRecordAndSummary(t *testing.T) {
+	jc := NewJobContext(nil, nil)
+	if err := jc.Record(map[string]int{"throughput": 100}); err != nil {
+		t.Fatalf("Record: %v", err)
+	}
+	jc.SetSummary("100 ops/s")
+
+	var got map[string]int
+	if err := json.Unmarshal(jc.Data(), &got); err != nil {
+		t.Fatalf("Data not valid JSON: %v", err)
+	}
+	if got["throughput"] != 100 {
+		t.Errorf("Data = %v, want throughput=100", got)
+	}
+	if jc.Summary() != "100 ops/s" {
+		t.Errorf("Summary = %q", jc.Summary())
+	}
+}
+
+// customSetupJob overrides Setup; the framework should call the override.
+type customSetupJob struct {
+	JobBase
+	setupCalled bool
+}
+
+func (j *customSetupJob) Declare(*JobContext)                    {}
+func (j *customSetupJob) Run(context.Context, *JobContext) error { return nil }
+func (j *customSetupJob) Setup(context.Context, *JobContext) error {
+	j.setupCalled = true
+	return nil
+}
+
+func TestJobOverrideSetup(t *testing.T) {
+	j := &customSetupJob{}
+	var job Job = j
+	if err := job.Setup(context.Background(), NewJobContext(nil, nil)); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+	if !j.setupCalled {
+		t.Errorf("override Setup was not called via the interface")
+	}
+}
+
+func TestWriteArtifact(t *testing.T) {
+	var sink InMemoryEventSink
+	jc := NewJobContext(nil, &sink)
+	jc.resultsDir = t.TempDir()
+
+	jc.WriteArtifact("report.txt", []byte("first"))
+	// Writing the name again replaces the file: a job may rewrite a report as
+	// it goes, and the last version is the one that counts.
+	jc.WriteArtifact("report.txt", []byte("second"))
+
+	got, err := os.ReadFile(filepath.Join(jc.resultsDir, "report.txt"))
+	if err != nil {
+		t.Fatalf("artifact: %v", err)
+	}
+	if string(got) != "second" {
+		t.Errorf("artifact = %q, want the second write", got)
+	}
+	if errs := jc.persistErrors(); len(errs) != 0 {
+		t.Errorf("persist errors = %v, want none", errs)
+	}
+	// The trace narrates the write, attributed to the job's own call site.
+	events := sink.Events()
+	if len(events) != 2 {
+		t.Fatalf("events = %+v, want one per write", events)
+	}
+	e := events[1]
+	if e.Kind != EventLog || !strings.Contains(e.Message, "wrote artifact report.txt (6 bytes)") {
+		t.Errorf("event = %+v, want a log of the write", e)
+	}
+	if e.Site == nil || e.Site.File != "job_test.go" {
+		t.Errorf("event site = %+v, want the job's call site", e.Site)
+	}
+}
+
+func TestWriteArtifactNoResultsDir(t *testing.T) {
+	var sink InMemoryEventSink
+	jc := NewJobContext(nil, &sink)
+	jc.WriteArtifact("report.txt", []byte("report"))
+	if errs := jc.persistErrors(); len(errs) != 0 {
+		t.Errorf("persist errors = %v, want none: a run without results has nowhere to write", errs)
+	}
+	if events := sink.Events(); len(events) != 0 {
+		t.Errorf("events = %+v, want none for a write that did not happen", events)
+	}
+}
+
+func TestWriteArtifactRejectsNames(t *testing.T) {
+	jc := NewJobContext(nil, nil)
+	jc.Register(newFakeServiceSpec("svc", new([]string), 1))
+	// No results directory: a bad name is a programming error whether or not
+	// this run persists, so it must not wait for a persisting run to surface.
+	for _, name := range []string{
+		"", ".", "..", "a/b", // not a single non-traversal component
+		"result.json", "test_log", "events.ndjson", // the framework's own files
+		"svc", // the directory of the registered service
+		// Case variants of those: on a case-insensitive filesystem they are the
+		// same file, and the trace is open under the lowercase name.
+		"EVENTS.NDJSON", "Test_Log", "Result.JSON", "SVC",
+	} {
+		func() {
+			defer func() {
+				if recover() == nil {
+					t.Errorf("WriteArtifact(%q) did not panic", name)
+				}
+			}()
+			jc.WriteArtifact(name, nil)
+		}()
+	}
+}
+
+func TestWriteArtifactRecordsWriteFailure(t *testing.T) {
+	// A results directory that is a regular file: the artifact cannot be
+	// written under it. The failure is kept for the result rather than
+	// returned, since it is the results tree that is short, not the job.
+	file := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(file, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var sink InMemoryEventSink
+	jc := NewJobContext(nil, &sink)
+	jc.resultsDir = file
+
+	jc.WriteArtifact("report.txt", []byte("report"))
+
+	errs := jc.persistErrors()
+	if len(errs) != 1 || !strings.Contains(errs[0].Error(), "write artifact report.txt") {
+		t.Fatalf("persist errors = %v, want the failed write", errs)
+	}
+	events := sink.Events()
+	if len(events) != 1 || events[0].Level != "error" || !strings.Contains(events[0].Message, "could not write artifact report.txt") {
+		t.Errorf("events = %+v, want an error log of the failed write", events)
+	}
+}
+
+func TestWriteArtifactSerializesConcurrentWrites(t *testing.T) {
+	// Two goroutines writing the same name: a write truncates and then fills
+	// the file, so unserialized they could interleave and leave a file that
+	// is neither's. Whichever lands last, the file is one write's whole data.
+	jc := NewJobContext(nil, nil)
+	jc.resultsDir = t.TempDir()
+	big := bytes.Repeat([]byte("a"), 1<<20)
+	small := bytes.Repeat([]byte("b"), 17)
+	path := filepath.Join(jc.resultsDir, "report.bin")
+	for i := range 20 {
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() { defer wg.Done(); jc.WriteArtifact("report.bin", big) }()
+		go func() { defer wg.Done(); jc.WriteArtifact("report.bin", small) }()
+		wg.Wait()
+		got, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("artifact: %v", err)
+		}
+		if !bytes.Equal(got, big) && !bytes.Equal(got, small) {
+			t.Fatalf("round %d: artifact is %d bytes and neither write's data", i, len(got))
+		}
+	}
+	if errs := jc.persistErrors(); len(errs) != 0 {
+		t.Errorf("persist errors = %v, want none", errs)
+	}
+}
